@@ -1,0 +1,14 @@
+.idea/
+.vscode/
+.venv*/
+venv*/
+__pycache__/
+dist/
+.coverage*
+htmlcov/
+.tox/
+.env
+.env.*
+*.pem
+*.key
+docs/_build/
