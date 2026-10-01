@@ -8,6 +8,7 @@ from collections import deque
 
 from flask import abort
 from flask import current_app
+from flask import Flask
 from flask import g
 from flask import request
 from flask import Response
@@ -25,13 +26,17 @@ class TemplateDebugPanel(DebugPanel):
     name = "Template"
     has_content = True
 
-    # save the context for the 5 most recent requests
-    template_cache: deque[tuple[str, list[dict[str, t.Any]]]] = deque(maxlen=5)
+    # save the context for the 5 most recent requests; each entry is
+    # tagged with the app that rendered it so that apps sharing this
+    # process can only see their own templates
+    template_cache: deque[tuple[Flask, str, list[dict[str, t.Any]]]] = deque(maxlen=5)
 
     @classmethod
     def get_cache_for_key(cls, key: str) -> list[dict[str, t.Any]]:
-        for cache_key, value in cls.template_cache:
-            if key == cache_key:
+        app = current_app._get_current_object()  # type: ignore[attr-defined]
+
+        for cache_app, cache_key, value in cls.template_cache:
+            if key == cache_key and cache_app is app:
                 return value
 
         raise KeyError(key)
@@ -40,13 +45,18 @@ class TemplateDebugPanel(DebugPanel):
         super().__init__(*args, **kwargs)
         self.key: str = str(uuid.uuid4())
         self.templates: list[dict[str, t.Any]] = []
-        template_rendered.connect(self._store_template_info)
+        # only record templates rendered by the app this request belongs
+        # to, not those of other apps sharing the process
+        template_rendered.connect(
+            self._store_template_info,
+            sender=current_app._get_current_object(),  # type: ignore[attr-defined]
+        )
 
-    def _store_template_info(self, sender: t.Any, **kwargs: t.Any) -> None:
+    def _store_template_info(self, sender: Flask, **kwargs: t.Any) -> None:
         # only record in the cache if the editor is enabled and there is
         # actually a template for this request
         if not self.templates and is_editor_enabled():
-            self.template_cache.append((self.key, self.templates))
+            self.template_cache.append((sender, self.key, self.templates))
 
         self.templates.append(kwargs)
 
@@ -82,6 +92,20 @@ def require_enabled() -> None:
         abort(403)
 
 
+def _expired_key_response() -> Response:
+    """Response for editor keys that are unknown to the current app.
+
+    Returned when the key belongs to another app in this process or its
+    entry has been evicted from the cache, so the editing session can no
+    longer be used.
+    """
+    msg = {
+        "error": "This editing session is no longer available. "
+        "Reopen the template editor from a current page."
+    }
+    return Response(json.dumps(msg), status=404, mimetype="application/json")
+
+
 def _get_source(template: Template) -> str:
     if template.filename is None:
         return ""
@@ -101,7 +125,11 @@ def template_editor(key: str) -> str:
     require_enabled()
     # TODO set up special loader that caches templates it loads
     # and can override template contents
-    templates = [t["template"] for t in TemplateDebugPanel.get_cache_for_key(key)]
+    try:
+        templates = [t["template"] for t in TemplateDebugPanel.get_cache_for_key(key)]
+    except KeyError:
+        abort(404)
+
     return g.debug_toolbar.render(  # type: ignore[no-any-return]
         "panels/template_editor.html",
         {
@@ -115,9 +143,14 @@ def template_editor(key: str) -> str:
 
 
 @module.route("/template/<key>/save", methods=["POST"])
-def save_template(key: str) -> str:
+def save_template(key: str) -> str | Response:
     require_enabled()
-    template = TemplateDebugPanel.get_cache_for_key(key)[0]["template"]
+
+    try:
+        template = TemplateDebugPanel.get_cache_for_key(key)[0]["template"]
+    except KeyError:
+        return _expired_key_response()
+
     content = request.form["content"].encode(_template_encoding())
 
     with open(template.filename, "wb") as fp:
@@ -129,7 +162,12 @@ def save_template(key: str) -> str:
 @module.route("/template/<key>", methods=["POST"])
 def template_preview(key: str) -> str | Response:
     require_enabled()
-    context = TemplateDebugPanel.get_cache_for_key(key)[0]["context"]
+
+    try:
+        context = TemplateDebugPanel.get_cache_for_key(key)[0]["context"]
+    except KeyError:
+        return _expired_key_response()
+
     content = request.form["content"]
     env = current_app.jinja_env.overlay(autoescape=True)
 

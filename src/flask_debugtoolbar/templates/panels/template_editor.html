@@ -43,6 +43,9 @@
 
     #flDebugToolbar button { margin: 0; }
     #flDebugSave { float: left; }
+    #flDebugSave:disabled { opacity: 0.5; }
+    #flDebugStatus { margin-left: 8px; line-height: {{ toolbar_height }}px; }
+    #flDebugStatus.flDebugError { color: #c00; }
     #flDebugClose { float: right; }
     {% endwith %}
   </style>
@@ -52,6 +55,7 @@
   <div id="flDebugPanel">
     <div id="flDebugToolbar">
       <button id="flDebugSave">Save</button>
+      <span id="flDebugStatus"></span>
       <button id="flDebugClose">Close</button>
     </div>
     <div id="flDebugEditor">
@@ -89,11 +93,29 @@
       return false;
     });
 
-    $('#flDebugSave').click(function() {
+    var saveButton = $('#flDebugSave');
+    var statusLine = $('#flDebugStatus');
+    var editingExpired = false;
+
+    saveButton.click(function() {
+      if (editingExpired) {
+        return false;
+      }
       $.ajax({
         type: 'POST'
       , url: document.baseURI + '/save'
       , data: {content: editor.getValue()}
+      , success: function() {
+          statusLine.removeClass('flDebugError').text('Saved.');
+        }
+      , error: function(xhr) {
+          if (xhr.status === 404) {
+            editingSessionExpired();
+          } else {
+            statusLine.addClass('flDebugError')
+              .text('Save failed (status ' + xhr.status + ').');
+          }
+        }
       });
     });
 
@@ -116,6 +138,9 @@
     , onChange: function() {
         clearTimeout(delay);
         delay = setTimeout(updatePreview, 300);
+        if (!editingExpired) {
+          statusLine.removeClass('flDebugError').text('');
+        }
       }
     });
 
@@ -123,7 +148,29 @@
     var preview = previewFrame.contentDocument || previewFrame.contentWindow.document;
     var errorLine = null;
 
+    // The cached template data for this page's request is gone (evicted by
+    // newer requests), so previewing and saving can no longer work. Say so
+    // instead of leaving stale content on screen.
+    function editingSessionExpired() {
+      editingExpired = true;
+      saveButton.prop('disabled', true);
+      statusLine.addClass('flDebugError').text(
+        'This editing session is no longer available, so preview and save ' +
+        'are disabled. Reopen the editor from a current page to continue.'
+        );
+      preview.open();
+      preview.write(
+        '<p style="color: #c00; font-family: sans-serif; margin: 1em;">' +
+        'The preview is no longer available because this editing session ' +
+        'has expired.</p>'
+        );
+      preview.close();
+    }
+
     function updatePreview() {
+      if (editingExpired) {
+        return;
+      }
       $.ajax({
         type: 'POST'
       , url: ''
@@ -138,14 +185,24 @@
           $('head', preview).append('<base target="_top">');
         }
       , error: function(xhr, status, error) {
-          if (status === 'error') {
-            var data = JSON.parse(xhr.responseText);
-            console.log(data);
-            if (errorLine != null) {
-              editor.setLineClass(errorLine, null, null);
-            }
-            errorLine = editor.setLineClass(data.lineno - 1, null, 'syntax-error');
+          if (xhr.status === 404) {
+            editingSessionExpired();
+            return;
           }
+          var data;
+          try {
+            data = JSON.parse(xhr.responseText);
+          } catch (e) {
+            // not a JSON error response (e.g. an HTML error page)
+            return;
+          }
+          if (data.lineno == null) {
+            return;
+          }
+          if (errorLine != null) {
+            editor.setLineClass(errorLine, null, null);
+          }
+          errorLine = editor.setLineClass(data.lineno - 1, null, 'syntax-error');
         }
       });
     }
