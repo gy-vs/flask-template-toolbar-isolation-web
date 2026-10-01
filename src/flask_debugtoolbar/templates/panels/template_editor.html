@@ -43,7 +43,10 @@
 
     #flDebugToolbar button { margin: 0; }
     #flDebugSave { float: left; }
+    #flDebugSave:disabled { opacity: 0.5; }
     #flDebugClose { float: right; }
+    #flDebugStatus { margin-left: 8px; line-height: {{ toolbar_height }}px; }
+    #flDebugStatus.flDebugStatusError { color: #c00; font-weight: bold; }
     {% endwith %}
   </style>
 </head>
@@ -52,6 +55,7 @@
   <div id="flDebugPanel">
     <div id="flDebugToolbar">
       <button id="flDebugSave">Save</button>
+      <span id="flDebugStatus"></span>
       <button id="flDebugClose">Close</button>
     </div>
     <div id="flDebugEditor">
@@ -89,11 +93,49 @@
       return false;
     });
 
-    $('#flDebugSave').click(function() {
+    var saveButton = $('#flDebugSave');
+    var statusLine = $('#flDebugStatus');
+    var editingExpired = false;
+
+    function parseErrorResponse(xhr) {
+      try {
+        return JSON.parse(xhr.responseText);
+      } catch (e) {
+        return null;
+      }
+    }
+
+    function showStatus(message, isError) {
+      statusLine.text(message).toggleClass('flDebugStatusError', !!isError);
+    }
+
+    function expireEditing(message) {
+      editingExpired = true;
+      saveButton.prop('disabled', true);
+      showStatus(message || 'The recorded template data for this page is no' +
+        ' longer available. Preview and save are disabled; reload the page' +
+        ' and reopen the editor.', true);
+    }
+
+    saveButton.click(function() {
+      if (editingExpired) {
+        return;
+      }
       $.ajax({
         type: 'POST'
       , url: document.baseURI + '/save'
       , data: {content: editor.getValue()}
+      , success: function() {
+          showStatus('Template saved.', false);
+        }
+      , error: function(xhr) {
+          var data = parseErrorResponse(xhr);
+          if (xhr.status === 404) {
+            expireEditing(data && data.error);
+          } else {
+            showStatus((data && data.error) || 'The template could not be saved.', true);
+          }
+        }
       });
     });
 
@@ -124,6 +166,9 @@
     var errorLine = null;
 
     function updatePreview() {
+      if (editingExpired) {
+        return;
+      }
       $.ajax({
         type: 'POST'
       , url: ''
@@ -138,13 +183,14 @@
           $('head', preview).append('<base target="_top">');
         }
       , error: function(xhr, status, error) {
-          if (status === 'error') {
-            var data = JSON.parse(xhr.responseText);
-            console.log(data);
+          var data = parseErrorResponse(xhr);
+          if (data && data.lineno != null) {
             if (errorLine != null) {
               editor.setLineClass(errorLine, null, null);
             }
             errorLine = editor.setLineClass(data.lineno - 1, null, 'syntax-error');
+          } else if (xhr.status === 404) {
+            expireEditing(data && data.error);
           }
         }
       });
